@@ -1604,6 +1604,16 @@ NORETURN void real_main(int argc, char** argv) {
 
 int main(int argc, char** argv) {
 #if defined(_MSC_VER)
+  HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\Ninja");
+  while(mutex == nullptr)
+  {
+    mutex = CreateMutexW(nullptr, TRUE, L"Global\\Ninja");
+  }
+
+  WaitForSingleObject( 
+            mutex,    // handle to mutex
+            INFINITE);  // no time-out interval
+
   // Set a handler to catch crashes not caught by the __try..__except
   // block (e.g. an exception in a stack-unwind-block).
   std::set_terminate(TerminateHandler);
@@ -1611,10 +1621,14 @@ int main(int argc, char** argv) {
     // Running inside __try ... __except suppresses any Windows error
     // dialogs for errors such as bad_alloc.
     real_main(argc, argv);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
   }
   __except(ExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
     // Common error situations return exitCode=1. 2 was chosen to
     // indicate a more serious problem.
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
     return 2;
   }
 #else
