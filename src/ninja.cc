@@ -1602,17 +1602,78 @@ NORETURN void real_main(int argc, char** argv) {
 
 }  // anonymous namespace
 
-int main(int argc, char** argv) {
 #if defined(_MSC_VER)
-  HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Global\\Ninja");
-  while(mutex == nullptr)
-  {
-    mutex = CreateMutexW(nullptr, TRUE, L"Global\\Ninja");
+
+HANDLE bcs_global_mutex_hack_start(int& argc, char**& argv)
+{
+  auto print_arguments = [&](){
+      //printf("------------------------------\n");
+      //for (int j = 0; j < argc - 1; j++) {
+      //  printf("'%s'\n", argv[j]);
+      //}
+      //printf("------------------------------\n");
+  };
+  auto remove_argument = [&](int i){
+      // remove the argument from the list
+      print_arguments();
+      for (int j = i; j < argc - 1; j++) {
+          //printf("%s <<<<< %s\n", argv[j], argv[j + 1]);
+          argv[j] = argv[j + 1];
+      }
+      argc--;
+      print_arguments();
+  };
+
+  HANDLE mutex = NULL;
+  for (int i = 1; i < argc; i++) {
+    const char* arg = argv[i];
+    if (strcmp(arg, "-winmutex") == 0) {
+      //printf("The '-winmutex' option was found in the command line.\n");
+      remove_argument(i);
+      if (i >= argc)
+      {
+        //printf("Couldn't get mutex name.\n");
+        return INVALID_HANDLE_VALUE;
+      }
+      const char* winmutex_name = argv[i];
+      //printf("The winmutex name option was found in the command line. '%s'\n", winmutex_name);
+      // remove the argument from the list
+      remove_argument(i);
+      while(mutex == NULL) {
+        mutex = CreateMutexA(nullptr, TRUE, winmutex_name);
+      }
+      break;
+    }
   }
 
-  WaitForSingleObject( 
-            mutex,    // handle to mutex
-            INFINITE);  // no time-out interval
+  if (mutex != NULL) {
+    WaitForSingleObject( 
+              mutex,    // handle to mutex
+              INFINITE);  // no time-out interval
+  }
+  else {
+      //printf("The '-winmutex' option was NOT found in the command line.\n");
+  }
+  return mutex;
+}
+
+void bcs_global_mutex_hack_end(HANDLE mutex)
+{
+  if (mutex != NULL) {
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+  }
+}
+
+#endif
+
+int main(int argc, char** argv) {
+#if defined(_MSC_VER)
+  HANDLE mutex = bcs_global_mutex_hack_start(argc, argv);
+  if(mutex == INVALID_HANDLE_VALUE)
+  {
+    return -1;
+  }
 
   // Set a handler to catch crashes not caught by the __try..__except
   // block (e.g. an exception in a stack-unwind-block).
@@ -1621,14 +1682,12 @@ int main(int argc, char** argv) {
     // Running inside __try ... __except suppresses any Windows error
     // dialogs for errors such as bad_alloc.
     real_main(argc, argv);
-    ReleaseMutex(mutex);
-    CloseHandle(mutex);
+    bcs_global_mutex_hack_end(mutex);
   }
   __except(ExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
     // Common error situations return exitCode=1. 2 was chosen to
     // indicate a more serious problem.
-    ReleaseMutex(mutex);
-    CloseHandle(mutex);
+    bcs_global_mutex_hack_end(mutex);
     return 2;
   }
 #else
