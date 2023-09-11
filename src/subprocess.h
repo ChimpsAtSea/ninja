@@ -58,6 +58,9 @@ struct Subprocess {
   std::string buf_;
 
 #ifdef _WIN32
+  static DWORD WINAPI ThreadFunction(LPVOID lpParam);
+  bool is_thread = false;
+  volatile long thread_event_count = 0;
   /// Set up pipe_ as the parent-side pipe of the subprocess; return the
   /// other end of the pipe, usable in the child process.
   HANDLE SetupPipe(HANDLE ioport);

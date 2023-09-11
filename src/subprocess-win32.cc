@@ -18,6 +18,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <regex>
 
 #include "util.h"
 
@@ -74,8 +75,207 @@ HANDLE Subprocess::SetupPipe(HANDLE ioport) {
   return output_write_child;
 }
 
+// http://alter.org.ua/en/docs/win/args/
+static PCHAR* CommandLineToArgvA(PCHAR CmdLine, int* _argc)
+{
+    PCHAR* argv;
+    PCHAR  _argv;
+    ULONG  len;
+    ULONG  argc;
+    CHAR   a;
+    ULONG  i, j;
+
+    BOOLEAN  in_QM;
+    BOOLEAN  in_TEXT;
+    BOOLEAN  in_SPACE;
+
+    len = strlen(CmdLine);
+    i = ((len + 2) / 2) * sizeof(PVOID) + sizeof(PVOID);
+
+    argv = (PCHAR*)GlobalAlloc(GMEM_FIXED, i + (len + 2) * sizeof(CHAR));
+
+    _argv = (PCHAR)(((PUCHAR)argv) + i);
+
+    argc = 0;
+    argv[argc] = _argv;
+    in_QM = FALSE;
+    in_TEXT = FALSE;
+    in_SPACE = TRUE;
+    i = 0;
+    j = 0;
+
+    while (a = CmdLine[i]) {
+        if (in_QM) {
+            if (a == '\"') {
+                in_QM = FALSE;
+            }
+            else {
+                _argv[j] = a;
+                j++;
+            }
+        }
+        else {
+            switch (a) {
+            case '\"':
+                in_QM = TRUE;
+                in_TEXT = TRUE;
+                if (in_SPACE) {
+                    argv[argc] = _argv + j;
+                    argc++;
+                }
+                in_SPACE = FALSE;
+                break;
+            case ' ':
+            case '\t':
+            case '\n':
+            case '\r':
+                if (in_TEXT) {
+                    _argv[j] = '\0';
+                    j++;
+                }
+                in_TEXT = FALSE;
+                in_SPACE = TRUE;
+                break;
+            default:
+                in_TEXT = TRUE;
+                if (in_SPACE) {
+                    argv[argc] = _argv + j;
+                    argc++;
+                }
+                _argv[j] = a;
+                j++;
+                in_SPACE = FALSE;
+                break;
+            }
+        }
+        i++;
+    }
+    _argv[j] = '\0';
+    argv[argc] = NULL;
+
+    (*_argc) = argc;
+    return argv;
+}
+
+// Function that will be executed in the new thread
+struct ThreadFunctionParams
+{
+  Subprocess* subprocess;
+  std::string command;
+  HANDLE child_pipe;
+};
+DWORD WINAPI Subprocess::ThreadFunction(LPVOID lpParam)
+{
+    ThreadFunctionParams* threadParams = (ThreadFunctionParams*)lpParam; // Cast the parameter back to the correct type
+
+    DWORD exitStatus = 0;
+
+    int nArgs;
+    PCHAR *szArglist = CommandLineToArgvA((PCHAR)threadParams->command.data(), &nArgs);
+    if (szArglist == nullptr)
+    {
+        threadParams->subprocess->buf_ = "CommandLineToArgvA failed: Wut?\n";
+        exitStatus = GetLastError();
+    }
+    else if(nArgs >= 2)
+    {
+        PCHAR procedure_name = szArglist[0];
+        PCHAR module_path = szArglist[1];
+        HMODULE hModule = LoadLibraryA(module_path);
+        if (hModule == NULL)
+        {
+            threadParams->subprocess->buf_ = "LoadLibraryA failed: Couldn't find the module '";
+            threadParams->subprocess->buf_ += module_path;
+            threadParams->subprocess->buf_ += "'\n";
+            exitStatus = GetLastError();
+        }
+        else
+        {
+            FARPROC procedure = GetProcAddress(hModule, procedure_name);
+            if(procedure)
+            {
+              DWORD (*entry)(int nArgs, PCHAR *szArglist) = reinterpret_cast<decltype(entry)>(procedure);
+              exitStatus = entry(nArgs - 2, szArglist + 2);
+            }
+            else {
+              threadParams->subprocess->buf_ =
+                  "LoadLibraryA failed: Couldn't find the procedure '";
+              threadParams->subprocess->buf_ += procedure_name;
+              threadParams->subprocess->buf_ += "'\n";
+              exitStatus = ERROR_PROC_NOT_FOUND;
+            }
+
+            // FreeLibrary(hModule); // #TODO: Correctly free library
+        }
+        
+    }
+    else
+    {   
+        threadParams->subprocess->buf_ = "Not enough arguments from CommandLineToArgvA\n";
+        exitStatus = ERROR_MOD_NOT_FOUND;
+    }
+
+    long event_index = InterlockedIncrementAcquire(
+        &const_cast<Subprocess*>(threadParams->subprocess)->thread_event_count);
+    (void)event_index;
+
+    HANDLE pipe = threadParams->subprocess->pipe_;
+    threadParams->subprocess->pipe_ = NULL;
+    CloseHandle(pipe);
+
+    if (threadParams->child_pipe)
+        CloseHandle(threadParams->child_pipe);
+
+    if (!PostQueuedCompletionStatus(SubprocessSet::ioport_, 0,
+                                    (ULONG_PTR)threadParams->subprocess, NULL))
+        Win32Fatal("PostQueuedCompletionStatus");
+
+    LocalFree(szArglist);
+    delete threadParams;
+
+    return exitStatus;
+}
+
 bool Subprocess::Start(SubprocessSet* set, const string& command) {
   HANDLE child_pipe = SetupPipe(set->ioport_);
+
+  // Define a regular expression pattern
+  static std::regex frontend_pattern(R"(\s*^thread_frontend:\s*(.+)$)");
+  std::smatch match;
+  if (std::regex_match(command, match, frontend_pattern))
+  {
+    ThreadFunctionParams* threadParam = new ThreadFunctionParams();
+    threadParam->subprocess = this;
+    threadParam->command = match[1];
+
+    // Create a thread and pass the parameter
+    HANDLE hThread;
+    DWORD dwThreadId;
+    hThread = CreateThread(
+        NULL,                   // Default security attributes
+        0,                      // Default stack size
+        ThreadFunction,         // Thread function to execute
+        threadParam,                // Parameter to pass to the thread function
+        0,                      // Default creation flags
+        &dwThreadId             // Variable to receive the thread ID
+    );
+    if(hThread == NULL)
+    {
+      if (child_pipe)
+        CloseHandle(child_pipe);
+
+      delete threadParam;
+
+      //DWORD error = GetLastError();
+      buf_ = "CreateThread failed: Somebody find Bill Gates quick!\n";
+      Win32Fatal("CreateThread", "Somebody find Bill Gates quick!");
+    }
+
+    is_thread = true;
+    child_ = hThread;
+
+    return true;
+  }
 
   SECURITY_ATTRIBUTES security_attributes;
   memset(&security_attributes, 0, sizeof(SECURITY_ATTRIBUTES));
@@ -155,6 +355,9 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
 }
 
 void Subprocess::OnPipeReady() {
+  if (is_thread)
+    return;
+
   DWORD bytes;
   if (!GetOverlappedResult(pipe_, &overlapped_, &bytes, TRUE)) {
     if (GetLastError() == ERROR_BROKEN_PIPE) {
@@ -193,7 +396,10 @@ ExitStatus Subprocess::Finish() {
   WaitForSingleObject(child_, INFINITE);
 
   DWORD exit_code = 0;
-  GetExitCodeProcess(child_, &exit_code);
+  if (is_thread)
+    GetExitCodeThread(child_, &exit_code);
+  else
+    GetExitCodeProcess(child_, &exit_code);
 
   CloseHandle(child_);
   child_ = NULL;
@@ -204,6 +410,12 @@ ExitStatus Subprocess::Finish() {
 }
 
 bool Subprocess::Done() const {
+  if (is_thread)
+  {
+    long event_index = InterlockedIncrementAcquire(
+        &const_cast<Subprocess*>(this)->thread_event_count);
+    return event_index == 3;
+  }
   return pipe_ == NULL;
 }
 
